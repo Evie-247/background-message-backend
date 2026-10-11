@@ -88,6 +88,7 @@ function emptyMeta() {
     proactive: {},
     pendingMessages: [],
     aiConfig: null,
+    proactiveAiConfig: null, // 主动消息专用的 AI 设置（可选；没有就用 aiConfig）
     jobs: {}
   };
 }
@@ -639,10 +640,33 @@ export class BackgroundBackend {
         model: String(ai.model).trim()
       };
 
+      let configChanged = false;
       if (JSON.stringify(meta.aiConfig) !== JSON.stringify(nextAiConfig)) {
         meta.aiConfig = nextAiConfig;
-        await this.saveMeta(meta);
+        configChanged = true;
       }
+
+      // 主动消息专用 API：传了完整设置就保存，传 null 就清除（改回用主 API）。
+      if ('proactiveAiConfig' in body) {
+        const pa = body.proactiveAiConfig;
+        let nextProactive = null;
+        if (pa && pa.url && pa.key && pa.model) {
+          const paProblem = checkAiUrl(pa.url);
+          if (paProblem) return json({ error: paProblem }, 400);
+          nextProactive = {
+            provider: String(pa.provider || 'newapi'),
+            url: String(pa.url).trim(),
+            key: String(pa.key).trim(),
+            model: String(pa.model).trim()
+          };
+        }
+        if (JSON.stringify(meta.proactiveAiConfig || null) !== JSON.stringify(nextProactive)) {
+          meta.proactiveAiConfig = nextProactive;
+          configChanged = true;
+        }
+      }
+
+      if (configChanged) await this.saveMeta(meta);
 
       return json({
         ok: true,
@@ -874,10 +898,14 @@ export class BackgroundBackend {
       results.push(result);
 
       try {
+        // 主动消息优先用专用 API（省主 API 额度），没设置就用主 API。
+        const proactiveAi = (meta.proactiveAiConfig?.url && meta.proactiveAiConfig?.key && meta.proactiveAiConfig?.model)
+          ? meta.proactiveAiConfig
+          : meta.aiConfig;
         if (
-          !meta.aiConfig?.url ||
-          !meta.aiConfig?.key ||
-          !meta.aiConfig?.model
+          !proactiveAi?.url ||
+          !proactiveAi?.key ||
+          !proactiveAi?.model
         ) {
           console.warn(
             '[BackgroundBackend] 未配置 AI API，跳过主动消息'
@@ -893,6 +921,8 @@ export class BackgroundBackend {
           }
 
           body.stream = false;
+          // 用副 API 时必须换成副 API 的模型名，否则请求里还带着主 API 的模型名。
+          if (proactiveAi !== meta.aiConfig) body.model = proactiveAi.model;
 
           body.messages.push({
             role: 'user',
@@ -900,7 +930,7 @@ export class BackgroundBackend {
               `[系统通知：我已经有一段时间没有和你互动了，请以${chat.realName || '角色'}的身份主动延续之前的对话、发起新话题，或对时间流逝做出反应。]`
           });
 
-          const response = await callAI(meta.aiConfig, body);
+          const response = await callAI(proactiveAi, body);
 
           const text =
             response
