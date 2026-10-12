@@ -583,7 +583,8 @@ export class BackgroundBackend {
             hasChatBody: (chat.bodyParts || 0) > 0,
             quietNow: isQuietAt(ar.quietHours, now),
             nextDueAt: dueAt,
-            lastRunAt: st.lastRunAt || 0, lastOkAt: st.lastOkAt || 0, lastError: st.lastError || null
+            lastRunAt: st.lastRunAt || 0, lastOkAt: st.lastOkAt || 0, lastError: st.lastError || null,
+            lastNotifiedCount: (st.lastNotified || []).length, lastNotified: st.lastNotified || []
           };
         });
       return json({
@@ -997,6 +998,7 @@ export class BackgroundBackend {
             };
 
             const notificationMessages = splitNotificationMessages(text, chat.statusRegex || '');
+            result.notified = notificationMessages.map(m => m.slice(0, 30));
             result.removed = await this.pushAll(
               meta.subscriptions,
               notificationMessages.map((notificationText, index) => ({
@@ -1052,7 +1054,8 @@ export class BackgroundBackend {
           fresh.proactiveStatus[result.chatId] = {
             lastRunAt: now,
             lastOkAt: result.message ? now : (prev.lastOkAt || 0),
-            lastError: result.error ? { at: now, message: result.error } : (result.message ? null : (prev.lastError || null))
+            lastError: result.error ? { at: now, message: result.error } : (result.message ? null : (prev.lastError || null)),
+            lastNotified: result.notified || prev.lastNotified || []
           };
         }
         if (result.message) {
@@ -1230,32 +1233,41 @@ function splitNotificationMessages(text, statusRegex = '') {
 
   const segments = [...visible.matchAll(/\[([^\]\r\n]+)\]/g)].map(match => match[1].trim());
   const messages = [];
+  // UwU 认得的消息格式（会显示成聊天气泡）才算「消息」；其它方括号内容（状态栏、动态评论、旁白标记等）
+  // UwU 不会显示成气泡，如果也弹通知，就会出现「通知了两次，点进去只有一条」。
+  const unknownSegments = [];
   for (const segment of segments) {
     if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) continue;
     if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) continue;
+    // UwU 本身不会把这些显示成聊天消息（动态/签名/群通知），也就不该弹系统通知，否则点进去会发现少一条。
+    if (/发布了一条(?:带图)?动态|更新了个性签名|邀请.*加入了群聊|修改群名为/.test(segment)) continue;
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
     const payload = payloadMatch ? payloadMatch[1].trim() : '';
     if (/的表情包[：:]/.test(segment) && payload) {
       messages.push(`发送了表情包：${payload}`);
-    } else if (/的消息[：:]|并回复[：:]|的语音[：:]|发来的照片\/视频[：:]|的转账[：:]|送来的礼物[：:]/.test(segment) && payload) {
+    } else if (/的消息[：:]|并回复[：:]|的语音[：:]|发来的(?:照片|视频)(?:\/视频)?[：:]|的转账[：:]|送来的礼物[：:]/.test(segment) && payload) {
       messages.push(payload);
     } else if (/撤回了一条消息[：:]/.test(segment) && payload) {
       messages.push(`撤回消息：${payload}`);
-    } else if (segment && !/更新状态为/.test(segment)) {
-      // Preserve other user-facing bracket messages, including future UwU formats.
+    } else if (/向.*发起了(?:视频|语音)通话/.test(segment)) {
       messages.push(segment.slice(0, 360));
+    } else if (segment && !/更新状态为/.test(segment)) {
+      unknownSegments.push(segment.slice(0, 360));
     }
   }
+  // 没有任何认得的格式时（比如模型换了写法），至少留一条通知，别让整条回复静悄悄。
+  if (!messages.length && unknownSegments.length) messages.push(unknownSegments[0]);
 
   if (!messages.length && !segments.length) {
     const lines = visible.replace(/<[^>]*>/g, '').trim().split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
     messages.push(...lines);
   }
 
+  // 去掉连续重复的同一句，避免同样的内容连弹两次通知。
   return messages
     .map(message => message.replace(/\s+/g, ' ').trim().slice(0, 360))
-    .filter(Boolean)
+    .filter((message, index, list) => message && message !== list[index - 1])
     .slice(0, 8);
 }
 
