@@ -301,14 +301,25 @@ export class BackgroundBackend {
 
   async loadMeta() {
     const stored = await this.state.storage.get('meta');
-    if (stored) return normalizeMeta(stored);
+    if (stored) {
+      const meta = normalizeMeta(stored);
+      meta.aiConfig = await openConfig(this.env, meta.aiConfig);
+      meta.proactiveAiConfig = await openConfig(this.env, meta.proactiveAiConfig);
+      return meta;
+    }
     const legacy = await this.state.storage.get('data');
     if (legacy) return this.migrateLegacy(legacy);
     return emptyMeta();
   }
 
   async saveMeta(meta) {
-    await this.state.storage.put('meta', meta);
+    // 存储时加密 API Key；内存里的 meta 保持明文，调用方照常使用。
+    const toStore = { ...meta };
+    toStore.aiConfig = await sealConfig(this.env, meta.aiConfig);
+    toStore.proactiveAiConfig = await sealConfig(this.env, meta.proactiveAiConfig);
+    delete toStore.aiConfig?.keyUnreadable;
+    delete toStore.proactiveAiConfig?.keyUnreadable;
+    await this.state.storage.put('meta', toStore);
   }
 
   // 把旧版单个 data 拆成新布局。可重复执行：最后才写 meta 并删除 data。
@@ -411,7 +422,7 @@ export class BackgroundBackend {
       const reqParts = await this.putBig(jobRequestKey(body.jobId), body.requestBody || {});
       const createdAt = Date.now();
       await this.state.storage.put(jobKey(body.jobId), {
-        jobId: body.jobId, status: 'queued', createdAt, aiConfig: body.aiConfig, reqParts,
+        jobId: body.jobId, status: 'queued', createdAt, aiConfig: await sealConfig(this.env, body.aiConfig), reqParts,
         chatId: body.chatId || '', chatType: body.chatType || 'private',
         chatName: String(body.chatName || meta.chats?.[body.chatId]?.remarkName || meta.chats?.[body.chatId]?.realName || '').slice(0, 120),
         chatStatusRegex: String(body.chatStatusRegex || meta.chats?.[body.chatId]?.statusRegex || '').slice(0, 500),
@@ -435,7 +446,7 @@ export class BackgroundBackend {
       job.status = 'processing';
       job.startedAt = Date.now();
       await this.state.storage.put(jobKey(body.jobId), job);
-      return json({ ok: true, job: { ...job, requestBody } });
+      return json({ ok: true, job: { ...job, aiConfig: await openConfig(this.env, job.aiConfig), requestBody } });
     }
 
     if (url.pathname === '/__internal/jobs/requeue' && request.method === 'POST') {
@@ -460,13 +471,33 @@ export class BackgroundBackend {
       const requestParts = job.reqParts || 0;
       job.status = body.error ? 'failed' : 'completed';
       job.updatedAt = Date.now();
-      // 任务结束后请求内容和 API Key 都不再需要，立刻清掉。
+      // 任务结束后请求内容和 API Key 都不再需要，立刻清掉（先记下明文 Key，只用来给错误信息脱敏）。
+      const jobPlainKey = body.error ? (await openConfig(this.env, job.aiConfig))?.key : '';
       delete job.aiConfig;
       job.reqParts = 0;
       if (body.error) job.error = String(body.error).slice(0, 1500);
       else job.response = body.response;
       await this.state.storage.put(jobKey(body.jobId), job);
       await this.deleteBig(jobRequestKey(body.jobId), requestParts);
+
+      if (body.error) {
+        // 后台回复失败：用户可能已经切走了，推一条提醒，不然只会一直等不到回复。
+        try {
+          const meta = await this.loadMeta();
+          const name = job.chatName || meta.chats?.[job.chatId]?.remarkName || meta.chats?.[job.chatId]?.realName || '新消息';
+          const removed = await this.pushAll(meta.subscriptions, [{
+            title: name,
+            body: `回复失败：${shortReason(body.error, jobPlainKey)}。点开重试`,
+            tag: `uwu-err-${job.jobId || body.jobId}`,
+            kind: 'error',
+            url: safeAppUrl(job.appUrl),
+            chatId: job.chatId, chatType: job.chatType
+          }]);
+          await this.removeSubscriptions(removed);
+        } catch (error) {
+          console.warn('[BackgroundBackend] 发送回复失败提醒出错', error);
+        }
+      }
 
       const content = body.error ? '' : body.response?.choices?.[0]?.message?.content;
       if (content) {
@@ -944,7 +975,7 @@ export class BackgroundBackend {
           console.warn(
             '[BackgroundBackend] 未配置 AI API，跳过主动消息'
           );
-          result.error = '后台没有 AI API 设置，请在 UwU 保存一次 API 设置';
+          result.error = (proactiveAi?.keyUnreadable || meta.aiConfig?.keyUnreadable) ? KEY_UNREADABLE_MESSAGE : '后台没有 AI API 设置，请在 UwU 保存一次 API 设置';
         } else {
           const body = await this.getBig(bodyKey(chatId), chat.bodyParts);
 
@@ -1019,7 +1050,7 @@ export class BackgroundBackend {
           error
         );
         // 记下失败原因（已脱敏），在 UwU 的「测试后台」里能看到，不用再猜。
-        result.error = String(error?.message || error || '未知错误').slice(0, 400);
+        result.error = redactSecrets(String(error?.message || error || '未知错误'), (meta.proactiveAiConfig?.key || meta.aiConfig?.key)).slice(0, 400);
       }
     }
 
@@ -1050,12 +1081,38 @@ export class BackgroundBackend {
         if (freshChat.autoReply) freshChat.autoReply.lastTriggerTime = now;
         {
           const prev = (fresh.proactiveStatus && fresh.proactiveStatus[result.chatId]) || {};
+          // 失败提醒：一连串失败只在开头提醒一次，之后每 12 小时最多再提醒一次，避免刷屏。
+          let errorNotifiedAt = prev.errorNotifiedAt || 0;
+          if (result.error) {
+            const streakStart = !prev.lastError;
+            if (streakStart || now - errorNotifiedAt > ERROR_NOTIFY_INTERVAL_MS) {
+              try {
+                const name = freshChat.remarkName || freshChat.realName || '角色';
+                const gone = await this.pushAll(fresh.subscriptions, [{
+                  title: 'UwU 后台提醒',
+                  body: `「${name}」的主动消息没发出去：${shortReason(result.error, '')}。点开检查 API 设置`,
+                  tag: `uwu-err-${result.chatId}`,
+                  kind: 'error',
+                  chatId: result.chatId,
+                  chatType: freshChat.chatType || 'private',
+                  url: safeAppUrl(freshChat.appUrl)
+                }]);
+                for (const endpoint of gone) removed.add(endpoint);
+                errorNotifiedAt = now;
+              } catch (error) {
+                console.warn('[BackgroundBackend] 发送失败提醒出错', error);
+              }
+            }
+          } else if (result.message) {
+            errorNotifiedAt = 0;
+          }
           if (!fresh.proactiveStatus || typeof fresh.proactiveStatus !== 'object') fresh.proactiveStatus = {};
           fresh.proactiveStatus[result.chatId] = {
             lastRunAt: now,
             lastOkAt: result.message ? now : (prev.lastOkAt || 0),
             lastError: result.error ? { at: now, message: result.error } : (result.message ? null : (prev.lastError || null)),
-            lastNotified: result.notified || prev.lastNotified || []
+            lastNotified: result.notified || prev.lastNotified || [],
+            errorNotifiedAt
           };
         }
         if (result.message) {
@@ -1104,6 +1161,67 @@ function checkAiUrl(value) {
   return '';
 }
 
+// ---------- API Key 静态加密 ----------
+// 存进 Durable Objects 的 API Key 用 AES-GCM 加密（密钥由 BACKEND_TOKEN 派生）。
+// 作用：存储内容被导出、备份或误看时不会直接露出明文 Key。没有 BACKEND_TOKEN 时不加密（保持旧行为）。
+const KEY_PREFIX = 'enc1:';
+const ERROR_NOTIFY_INTERVAL_MS = 12 * 60 * 60 * 1000;
+
+function b64(bytes) { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); }
+function unb64(text) { const s = atob(text); const out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; }
+
+async function deriveStorageKey(env) {
+  const token = String(env?.BACKEND_TOKEN || '');
+  if (!token) return null;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('uwu-aikey-v1|' + token));
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+async function sealSecret(env, plain) {
+  const text = String(plain || '');
+  if (!text || text.startsWith(KEY_PREFIX)) return text;
+  const key = await deriveStorageKey(env);
+  if (!key) return text;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)));
+  return `${KEY_PREFIX}${b64(iv)}:${b64(ct)}`;
+}
+
+// 解不开（例如换过 BACKEND_TOKEN）时返回空串，并标记 keyUnreadable，让调用方给出明确提示。
+async function openSecret(env, stored) {
+  const text = String(stored || '');
+  if (!text.startsWith(KEY_PREFIX)) return { value: text, ok: true };
+  try {
+    const key = await deriveStorageKey(env);
+    if (!key) return { value: '', ok: false };
+    const [iv, ct] = text.slice(KEY_PREFIX.length).split(':');
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(iv) }, key, unb64(ct));
+    return { value: new TextDecoder().decode(plain), ok: true };
+  } catch (error) {
+    return { value: '', ok: false };
+  }
+}
+
+async function sealConfig(env, cfg) {
+  if (!cfg || typeof cfg !== 'object') return cfg;
+  return { ...cfg, key: await sealSecret(env, cfg.key) };
+}
+
+async function openConfig(env, cfg) {
+  if (!cfg || typeof cfg !== 'object') return cfg;
+  const { value, ok } = await openSecret(env, cfg.key);
+  const next = { ...cfg, key: value };
+  if (!ok) next.keyUnreadable = true; else delete next.keyUnreadable;
+  return next;
+}
+
+const KEY_UNREADABLE_MESSAGE = 'API Key 无法解密（可能改过后台 Token），请在 UwU 重新保存一次 API 设置';
+
+// 错误提醒里的原因：脱敏、压成一行、限长。
+function shortReason(text, key, max = 80) {
+  return redactSecrets(String(text || ''), key).replace(/；?请求地址：\S*/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
 // 错误信息里去掉 API Key 或疑似密钥，避免上游服务商把密钥回显出来时被写进任务记录或返回给调用方。
 function redactSecrets(text, key) {
   let out = String(text ?? '');
@@ -1135,7 +1253,7 @@ async function callAIInner(
     !aiConfig?.model
   ) {
     throw new Error(
-      '尚未同步 AI API 设置'
+      aiConfig?.keyUnreadable ? KEY_UNREADABLE_MESSAGE : '尚未同步 AI API 设置'
     );
   }
 
