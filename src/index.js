@@ -89,6 +89,7 @@ function emptyMeta() {
     pendingMessages: [],
     aiConfig: null,
     proactiveAiConfig: null, // 主动消息专用的 AI 设置（可选；没有就用 aiConfig）
+    proactiveStatus: {}, // 每个聊天最近一次主动消息的结果（排查用，不含密钥）
     jobs: {}
   };
 }
@@ -564,6 +565,38 @@ export class BackgroundBackend {
       });
     }
 
+    // 主动消息状态：给 UwU 的「测试后台」显示，排查为什么没收到。不返回任何密钥。
+    if (url.pathname === '/v1/status' && request.method === 'GET') {
+      const meta = await this.loadMeta();
+      const now = Date.now();
+      const pa = meta.proactiveAiConfig?.url && meta.proactiveAiConfig?.key && meta.proactiveAiConfig?.model ? meta.proactiveAiConfig : null;
+      const chats = Object.entries(meta.chats || {})
+        .filter(([, chat]) => chat?.autoReply?.enabled)
+        .map(([chatId, chat]) => {
+          const ar = chat.autoReply;
+          const st = (meta.proactiveStatus && meta.proactiveStatus[chatId]) || {};
+          let dueAt = (latestTimestamp(ar.lastTriggerTime, chat.lastUserMessageAt) || now) + autoReplyIntervalMs(ar.interval);
+          { const probe = Math.max(dueAt, now); const shifted = skipQuiet(ar.quietHours, probe); if (shifted !== probe) dueAt = shifted; }
+          return {
+            chatId, name: chat.remarkName || chat.realName || chatId,
+            intervalMin: Math.round(autoReplyIntervalMs(ar.interval) / 60000),
+            hasChatBody: (chat.bodyParts || 0) > 0,
+            quietNow: isQuietAt(ar.quietHours, now),
+            nextDueAt: dueAt,
+            lastRunAt: st.lastRunAt || 0, lastOkAt: st.lastOkAt || 0, lastError: st.lastError || null
+          };
+        });
+      return json({
+        ok: true, now,
+        alarmAt: (await this.state.storage.getAlarm()) || null,
+        subscriptions: (meta.subscriptions || []).length,
+        aiModel: meta.aiConfig?.model || '',
+        proactiveModel: (pa || meta.aiConfig || {}).model || '',
+        usingProactiveApi: !!pa,
+        chats
+      });
+    }
+
     if (url.pathname === '/v1/messages/ack' && request.method === 'POST') {
       const body = await request.json();
       const ids = new Set(Array.isArray(body.ids) ? body.ids.map(String) : []);
@@ -910,6 +943,7 @@ export class BackgroundBackend {
           console.warn(
             '[BackgroundBackend] 未配置 AI API，跳过主动消息'
           );
+          result.error = '后台没有 AI API 设置，请在 UwU 保存一次 API 设置';
         } else {
           const body = await this.getBig(bodyKey(chatId), chat.bodyParts);
 
@@ -921,8 +955,9 @@ export class BackgroundBackend {
           }
 
           body.stream = false;
-          // 用副 API 时必须换成副 API 的模型名，否则请求里还带着主 API 的模型名。
-          if (proactiveAi !== meta.aiConfig) body.model = proactiveAi.model;
+          // 地址、密钥、模型是一组：一律用当前设置里的模型名。
+          // 否则换了 API/模型之后，请求里还带着上次聊天时的旧模型名，会被新的服务商拒绝，主动消息就悄悄失败。
+          body.model = proactiveAi.model;
 
           body.messages.push({
             role: 'user',
@@ -981,6 +1016,8 @@ export class BackgroundBackend {
           chatId,
           error
         );
+        // 记下失败原因（已脱敏），在 UwU 的「测试后台」里能看到，不用再猜。
+        result.error = String(error?.message || error || '未知错误').slice(0, 400);
       }
     }
 
@@ -1009,6 +1046,15 @@ export class BackgroundBackend {
         }
 
         if (freshChat.autoReply) freshChat.autoReply.lastTriggerTime = now;
+        {
+          const prev = (fresh.proactiveStatus && fresh.proactiveStatus[result.chatId]) || {};
+          if (!fresh.proactiveStatus || typeof fresh.proactiveStatus !== 'object') fresh.proactiveStatus = {};
+          fresh.proactiveStatus[result.chatId] = {
+            lastRunAt: now,
+            lastOkAt: result.message ? now : (prev.lastOkAt || 0),
+            lastError: result.error ? { at: now, message: result.error } : (result.message ? null : (prev.lastError || null))
+          };
+        }
         if (result.message) {
           fresh.pendingMessages.push(result.message);
           fresh.pendingMessages = limitPendingMessages(fresh.pendingMessages);
