@@ -77,4 +77,8 @@ AI Key 只应存储在自己控制的 Cloudflare Worker 中。
 - 不要公开你的 Worker 地址：即使没有 Token，被拒绝的请求也会占用 Cloudflare 免费额度。
 - 应用导出的备份文件包含 AI Key 和后台 Token（明文），请妥善保管。
 - 若想清除云端数据，删除该 Worker（及其 Durable Object）即可。
+- AI Key 存入 Worker 前会用由 `BACKEND_TOKEN` 派生的密钥加密。若更换了 `BACKEND_TOKEN`，需要在应用里重新保存一次 API 设置。
 
+## 特别感谢
+
+感谢糯米机两位老师 糯糯 TO 的想法授权
