@@ -1354,11 +1354,12 @@ function splitNotificationMessages(text, statusRegex = '') {
   // UwU 认得的消息格式（会显示成聊天气泡）才算「消息」；其它方括号内容（状态栏、动态评论、旁白标记等）
   // UwU 不会显示成气泡，如果也弹通知，就会出现「通知了两次，点进去只有一条」。
   const unknownSegments = [];
+  const ignoredRaw = []; // UwU 不会显示的方括号内容，兜底时要从整段文字里去掉
   for (const segment of segments) {
-    if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) continue;
-    if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) continue;
+    if (/更新状态为|system(?:-display)?\s*:/i.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
+    if (/已接收礼物|(?:接收|退回).*转账|(?:同意|拒绝).*代付/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
     // UwU 本身不会把这些显示成聊天消息（动态/签名/群通知），也就不该弹系统通知，否则点进去会发现少一条。
-    if (/发布了一条(?:带图)?动态|更新了个性签名|邀请.*加入了群聊|修改群名为/.test(segment)) continue;
+    if (/发布了一条(?:带图)?动态|更新了个性签名|邀请.*加入了群聊|修改群名为/.test(segment)) { ignoredRaw.push(`[${segment}]`); continue; }
 
     const payloadMatch = segment.match(/[：:]([\s\S]*)$/);
     const payload = payloadMatch ? payloadMatch[1].trim() : '';
@@ -1374,17 +1375,21 @@ function splitNotificationMessages(text, statusRegex = '') {
       unknownSegments.push(segment.slice(0, 360));
     }
   }
-  // 没有任何认得的格式时（比如模型换了写法），至少留一条通知，别让整条回复静悄悄。
-  if (!messages.length && unknownSegments.length) messages.push(unknownSegments[0]);
 
-  if (!messages.length && !segments.length) {
-    const lines = visible.replace(/<[^>]*>/g, '').trim().split(/\s*\r?\n+\s*/).map(line => line.trim()).filter(Boolean);
-    messages.push(...lines);
+  // 没有任何认得的消息格式时（线下剧情的长文字、或模型换了写法）：
+  // UwU 会把这段文字当成「一条消息」显示成一个气泡，所以通知也只发一条，不能按段落拆开。
+  if (!messages.length && (unknownSegments.length || !segments.length)) {
+    let whole = visible;
+    for (const raw of ignoredRaw) whole = whole.split(raw).join('');
+    whole = whole.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+    if (whole) messages.push(whole);
   }
 
   // 去掉连续重复的同一句，避免同样的内容连弹两次通知。
+  // 只有一条时（常见于线下长文）允许长一些，系统通知自己会折叠显示。
+  const cap = messages.length === 1 ? 600 : 360;
   return messages
-    .map(message => message.replace(/\s+/g, ' ').trim().slice(0, 360))
+    .map(message => message.replace(/\s+/g, ' ').trim().slice(0, cap))
     .filter((message, index, list) => message && message !== list[index - 1])
     .slice(0, 8);
 }
